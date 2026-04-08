@@ -318,8 +318,7 @@ def get_spend_by_objective(days_back: int = 30) -> str:
 
 # ── Entry Point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    mcp.run(
-        transport="sse",
-        host="0.0.0.0",
-        port=PORT,
-    )
+    # FastMCP reads HOST and PORT from environment automatically
+    os.environ.setdefault("FASTMCP_HOST", "0.0.0.0")
+    os.environ.setdefault("FASTMCP_PORT", str(PORT))
+    mcp.run(transport="sse")
