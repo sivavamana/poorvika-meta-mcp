@@ -1,322 +1,226 @@
 """
-Poorvika Meta Ads MCP Server
-Exposes Meta Marketing API as MCP tools for Claude to use autonomously.
+Poorvika Meta Ads MCP Server - Minimal stable version
 """
+import subprocess, sys
 
-# ── Bootstrap: auto-install dependencies if missing ──────────────────────────
-import subprocess
-import sys
+# Auto-install
+for pkg in ["httpx", "mcp[cli]", "uvicorn[standard]", "starlette"]:
+    subprocess.check_call(
+        [sys.executable, "-m", "pip", "install", pkg, "-q", "--root-user-action=ignore"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
 
-def _install(package):
-    subprocess.check_call([sys.executable, "-m", "pip", "install", package, "--quiet"])
-
-try:
-    import httpx
-except ImportError:
-    _install("httpx")
-    import httpx
-
-try:
-    from mcp.server.fastmcp import FastMCP
-except ImportError:
-    _install("mcp[cli]")
-    _install("uvicorn")
-    _install("starlette")
-    from mcp.server.fastmcp import FastMCP
-
-# ── Standard imports ──────────────────────────────────────────────────────────
-import os
-import json
+import os, json
 from datetime import datetime, timedelta
+import httpx
+import uvicorn
+from starlette.applications import Starlette
+from starlette.responses import JSONResponse
+from starlette.routing import Route, Mount
+from starlette.requests import Request
+from mcp.server import Server
+from mcp.server.sse import SseServerTransport
+from mcp import types
 
-# ── Init ──────────────────────────────────────────────────────────────────────
-mcp = FastMCP("poorvika-meta-ads")
-
-META_API_BASE = "https://graph.facebook.com/v19.0"
+# ── Config ────────────────────────────────────────────────────────────────────
+META_BASE     = "https://graph.facebook.com/v19.0"
 ACCESS_TOKEN  = os.environ.get("META_ACCESS_TOKEN", "")
 AD_ACCOUNT_ID = os.environ.get("META_AD_ACCOUNT_ID", "")
 PORT          = int(os.environ.get("PORT", 8000))
 
+# ── MCP Server ────────────────────────────────────────────────────────────────
+server = Server("poorvika-meta-ads")
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-
-def api_get(path: str, params: dict = {}) -> dict:
-    params["access_token"] = ACCESS_TOKEN
-    r = httpx.get(f"{META_API_BASE}{path}", params=params, timeout=30)
+def api_get(path, params=None):
+    p = params or {}
+    p["access_token"] = ACCESS_TOKEN
+    r = httpx.get(f"{META_BASE}{path}", params=p, timeout=30)
     r.raise_for_status()
     return r.json()
 
-
-def api_post(path: str, data: dict = {}) -> dict:
-    data["access_token"] = ACCESS_TOKEN
-    r = httpx.post(f"{META_API_BASE}{path}", data=data, timeout=30)
+def api_post(path, data=None):
+    d = data or {}
+    d["access_token"] = ACCESS_TOKEN
+    r = httpx.post(f"{META_BASE}{path}", data=d, timeout=30)
     r.raise_for_status()
     return r.json()
 
+def dr(days=7):
+    t = datetime.utcnow().date()
+    return {"since": str(t - timedelta(days=days)), "until": str(t)}
 
-def parse_campaign_name(name: str) -> dict:
+def parse_name(name):
     parts = [p.strip() for p in name.split("|")]
-    keys  = [
-        "main_category", "category", "sub_category", "objective",
-        "creative_type", "creative_type_2", "cta", "location",
-        "date", "staff_code"
-    ]
+    keys  = ["main_category","category","sub_category","objective",
+             "creative_type","creative_type_2","cta","location","date","staff_code"]
     return {keys[i]: parts[i] if i < len(parts) else "" for i in range(len(keys))}
 
+# ── Tool Definitions ──────────────────────────────────────────────────────────
+@server.list_tools()
+async def list_tools():
+    return [
+        types.Tool(name="get_campaigns",         description="Get all campaigns from Poorvika Meta Ads account", inputSchema={"type":"object","properties":{"status_filter":{"type":"string","default":"ACTIVE"}}}),
+        types.Tool(name="get_account_insights",  description="Get account-level performance summary",            inputSchema={"type":"object","properties":{"days_back":{"type":"integer","default":7}}}),
+        types.Tool(name="get_campaign_insights", description="Get insights for a specific campaign",             inputSchema={"type":"object","properties":{"campaign_id":{"type":"string"},"days_back":{"type":"integer","default":7}},"required":["campaign_id"]}),
+        types.Tool(name="get_adsets",            description="List all ad sets under a campaign",                inputSchema={"type":"object","properties":{"campaign_id":{"type":"string"}},"required":["campaign_id"]}),
+        types.Tool(name="get_daily_report",      description="Full daily performance report for Poorvika",       inputSchema={"type":"object","properties":{"days_back":{"type":"integer","default":7}}}),
+        types.Tool(name="get_top_campaigns",     description="Top N campaigns by metric (ctr/cpc/spend)",        inputSchema={"type":"object","properties":{"days_back":{"type":"integer","default":7},"metric":{"type":"string","default":"ctr"},"top_n":{"type":"integer","default":5}}}),
+        types.Tool(name="pause_campaign",        description="Pause a campaign by ID",                           inputSchema={"type":"object","properties":{"campaign_id":{"type":"string"}},"required":["campaign_id"]}),
+        types.Tool(name="resume_campaign",       description="Resume a paused campaign by ID",                   inputSchema={"type":"object","properties":{"campaign_id":{"type":"string"}},"required":["campaign_id"]}),
+        types.Tool(name="pause_adset",           description="Pause a specific ad set by ID",                    inputSchema={"type":"object","properties":{"adset_id":{"type":"string"}},"required":["adset_id"]}),
+        types.Tool(name="resume_adset",          description="Resume a paused ad set by ID",                     inputSchema={"type":"object","properties":{"adset_id":{"type":"string"}},"required":["adset_id"]}),
+        types.Tool(name="update_campaign_budget",description="Update campaign daily budget in INR",              inputSchema={"type":"object","properties":{"campaign_id":{"type":"string"},"new_daily_budget_inr":{"type":"number"}},"required":["campaign_id","new_daily_budget_inr"]}),
+        types.Tool(name="update_adset_budget",   description="Update ad set daily budget in INR",                inputSchema={"type":"object","properties":{"adset_id":{"type":"string"},"new_daily_budget_inr":{"type":"number"}},"required":["adset_id","new_daily_budget_inr"]}),
+        types.Tool(name="get_spend_by_objective",description="Spend breakdown by objective (REACH/TRAFFIC etc)", inputSchema={"type":"object","properties":{"days_back":{"type":"integer","default":30}}}),
+        types.Tool(name="validate_campaign_name",description="Validate Poorvika pipe-delimited campaign name",   inputSchema={"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}),
+    ]
 
-def date_range(days_back: int = 7) -> dict:
-    today = datetime.utcnow().date()
-    since = today - timedelta(days=days_back)
-    return {"since": str(since), "until": str(today)}
+# ── Tool Execution ─────────────────────────────────────────────────────────────
+@server.call_tool()
+async def call_tool(name, arguments):
+    try:
+        result = _execute(name, arguments)
+    except Exception as e:
+        result = json.dumps({"error": str(e)})
+    return [types.TextContent(type="text", text=result)]
 
+def _execute(name, args):
+    if name == "get_campaigns":
+        sf = args.get("status_filter", "ACTIVE")
+        p  = {"fields": "id,name,status,objective,daily_budget,lifetime_budget", "limit": 100}
+        if sf != "ALL":
+            p["effective_status"] = json.dumps([sf])
+        data = api_get(f"/{AD_ACCOUNT_ID}/campaigns", p)
+        out  = []
+        for c in data.get("data", []):
+            out.append({"id": c["id"], "name": c.get("name"), "status": c.get("status"),
+                        "objective": c.get("objective"),
+                        "daily_budget_inr": int(c["daily_budget"])/100 if c.get("daily_budget") else None,
+                        "parsed": parse_name(c.get("name",""))})
+        return json.dumps({"total": len(out), "campaigns": out}, indent=2)
 
-# ── TOOLS ─────────────────────────────────────────────────────────────────────
+    elif name == "get_account_insights":
+        days = args.get("days_back", 7)
+        d    = api_get(f"/{AD_ACCOUNT_ID}/insights",
+                       {"fields": "impressions,reach,clicks,spend,cpm,cpc,ctr,frequency",
+                        "time_range": json.dumps(dr(days))})
+        return json.dumps(d.get("data", [{}])[0], indent=2)
 
-@mcp.tool()
-def get_campaigns(status_filter: str = "ACTIVE") -> str:
-    """Fetch all campaigns from the Poorvika Meta Ads account.
-    status_filter: ACTIVE | PAUSED | ALL"""
-    params = {
-        "fields": "id,name,status,objective,daily_budget,lifetime_budget,created_time",
-        "limit": 100,
-    }
-    if status_filter != "ALL":
-        params["effective_status"] = json.dumps([status_filter])
-    data = api_get(f"/{AD_ACCOUNT_ID}/campaigns", params)
-    campaigns = data.get("data", [])
-    results = []
-    for c in campaigns:
-        parsed = parse_campaign_name(c.get("name", ""))
-        results.append({
-            "id":              c["id"],
-            "name":            c.get("name"),
-            "status":          c.get("status"),
-            "objective":       c.get("objective"),
-            "daily_budget":    int(c["daily_budget"]) / 100 if c.get("daily_budget") else None,
-            "lifetime_budget": int(c["lifetime_budget"]) / 100 if c.get("lifetime_budget") else None,
-            "created_time":    c.get("created_time"),
-            "parsed_name":     parsed,
-        })
-    return json.dumps({"total": len(results), "campaigns": results}, indent=2)
+    elif name == "get_campaign_insights":
+        d = api_get(f"/{args['campaign_id']}/insights",
+                    {"fields": "impressions,reach,clicks,spend,cpm,cpc,ctr,frequency",
+                     "time_range": json.dumps(dr(args.get("days_back", 7)))})
+        return json.dumps(d.get("data", [{}])[0], indent=2)
 
+    elif name == "get_adsets":
+        d = api_get(f"/{args['campaign_id']}/adsets",
+                    {"fields": "id,name,status,daily_budget,optimization_goal", "limit": 100})
+        return json.dumps({"total": len(d.get("data",[])), "adsets": d.get("data",[])}, indent=2)
 
-@mcp.tool()
-def get_campaign_insights(campaign_id: str, days_back: int = 7) -> str:
-    """Fetch performance insights for a specific campaign.
-    Returns impressions, reach, clicks, spend, CPM, CPC, CTR, frequency."""
-    params = {
-        "fields": "impressions,reach,clicks,spend,cpm,cpc,ctr,frequency,actions,cost_per_action_type",
-        "time_range": json.dumps(date_range(days_back)),
-    }
-    data = api_get(f"/{campaign_id}/insights", params)
-    insights = data.get("data", [{}])
-    return json.dumps(insights[0] if insights else {"message": "No data found"}, indent=2)
+    elif name == "get_daily_report":
+        days  = args.get("days_back", 7)
+        tr    = json.dumps(dr(days))
+        acct  = api_get(f"/{AD_ACCOUNT_ID}/insights",
+                        {"fields":"impressions,reach,clicks,spend,cpm,cpc,ctr","time_range":tr}).get("data",[{}])[0]
+        camps = api_get(f"/{AD_ACCOUNT_ID}/insights",
+                        {"fields":"campaign_name,spend,clicks,ctr,cpc","time_range":tr,
+                         "level":"campaign","limit":100}).get("data",[])
+        def sf(v):
+            try: return float(v)
+            except: return 0
+        by_spend = sorted(camps, key=lambda x: sf(x.get("spend",0)), reverse=True)
+        return json.dumps({
+            "date": str(datetime.utcnow().date()), "days": days,
+            "summary": {"spend": f"INR {sf(acct.get('spend',0)):,.2f}",
+                        "impressions": acct.get("impressions","0"),
+                        "clicks": acct.get("clicks","0"),
+                        "ctr": f"{sf(acct.get('ctr',0)):.2f}%",
+                        "cpc": f"INR {sf(acct.get('cpc',0)):,.2f}"},
+            "top_5": by_spend[:5], "bottom_5": by_spend[-5:]
+        }, indent=2)
 
+    elif name == "get_top_campaigns":
+        days   = args.get("days_back", 7)
+        metric = args.get("metric", "ctr")
+        top_n  = args.get("top_n", 5)
+        rows   = api_get(f"/{AD_ACCOUNT_ID}/insights",
+                         {"fields":"campaign_name,spend,clicks,ctr,cpc,impressions",
+                          "time_range":json.dumps(dr(days)),"level":"campaign","limit":100}).get("data",[])
+        def sf(v):
+            try: return float(v)
+            except: return 0
+        asc = metric in ["cpc","cpm"]
+        return json.dumps(sorted(rows, key=lambda x: sf(x.get(metric,0)), reverse=not asc)[:top_n], indent=2)
 
-@mcp.tool()
-def get_adsets(campaign_id: str) -> str:
-    """List all ad sets under a given campaign with budget, targeting, and status."""
-    params = {
-        "fields": "id,name,status,daily_budget,lifetime_budget,targeting,optimization_goal,billing_event,bid_amount",
-        "limit": 100,
-    }
-    data = api_get(f"/{campaign_id}/adsets", params)
-    return json.dumps({"total": len(data.get("data", [])), "adsets": data.get("data", [])}, indent=2)
+    elif name == "pause_campaign":
+        return json.dumps(api_post(f"/{args['campaign_id']}", {"status":"PAUSED"}))
 
+    elif name == "resume_campaign":
+        return json.dumps(api_post(f"/{args['campaign_id']}", {"status":"ACTIVE"}))
 
-@mcp.tool()
-def get_adset_insights(adset_id: str, days_back: int = 7) -> str:
-    """Fetch performance insights for a specific ad set."""
-    params = {
-        "fields": "impressions,reach,clicks,spend,cpm,cpc,ctr,frequency,actions,cost_per_action_type",
-        "time_range": json.dumps(date_range(days_back)),
-    }
-    data = api_get(f"/{adset_id}/insights", params)
-    insights = data.get("data", [{}])
-    return json.dumps(insights[0] if insights else {"message": "No data found"}, indent=2)
+    elif name == "pause_adset":
+        return json.dumps(api_post(f"/{args['adset_id']}", {"status":"PAUSED"}))
 
+    elif name == "resume_adset":
+        return json.dumps(api_post(f"/{args['adset_id']}", {"status":"ACTIVE"}))
 
-@mcp.tool()
-def get_account_insights(days_back: int = 7) -> str:
-    """Fetch overall account-level performance summary for Poorvika."""
-    params = {
-        "fields": "impressions,reach,clicks,spend,cpm,cpc,ctr,frequency",
-        "time_range": json.dumps(date_range(days_back)),
-    }
-    data = api_get(f"/{AD_ACCOUNT_ID}/insights", params)
-    insights = data.get("data", [{}])
-    return json.dumps(insights[0] if insights else {"message": "No data"}, indent=2)
+    elif name == "update_campaign_budget":
+        return json.dumps(api_post(f"/{args['campaign_id']}",
+                                   {"daily_budget": int(args["new_daily_budget_inr"]*100)}))
 
+    elif name == "update_adset_budget":
+        return json.dumps(api_post(f"/{args['adset_id']}",
+                                   {"daily_budget": int(args["new_daily_budget_inr"]*100)}))
 
-@mcp.tool()
-def pause_campaign(campaign_id: str) -> str:
-    """Pause a campaign by its ID."""
-    result = api_post(f"/{campaign_id}", {"status": "PAUSED"})
-    return json.dumps({"campaign_id": campaign_id, "action": "PAUSED", "result": result})
+    elif name == "get_spend_by_objective":
+        rows = api_get(f"/{AD_ACCOUNT_ID}/insights",
+                       {"fields":"objective,spend,impressions,clicks",
+                        "time_range":json.dumps(dr(args.get("days_back",30))),
+                        "level":"campaign","limit":100}).get("data",[])
+        bd = {}
+        for r in rows:
+            o = r.get("objective","UNKNOWN")
+            if o not in bd: bd[o] = {"spend":0,"impressions":0,"clicks":0,"count":0}
+            bd[o]["spend"]       += float(r.get("spend",0))
+            bd[o]["impressions"] += int(r.get("impressions",0))
+            bd[o]["clicks"]      += int(r.get("clicks",0))
+            bd[o]["count"]       += 1
+        for o in bd: bd[o]["spend"] = f"INR {bd[o]['spend']:,.2f}"
+        return json.dumps(bd, indent=2)
 
+    elif name == "validate_campaign_name":
+        name_val = args["name"]
+        parts    = [p.strip() for p in name_val.split("|")]
+        issues   = []
+        if len(parts) != 10:
+            issues.append(f"Expected 10 segments, got {len(parts)}")
+        parsed = parse_name(name_val)
+        if parsed.get("staff_code") not in {"AR","BS","SV","SK","UP","KP","RAJ","SD","DEE",""}:
+            issues.append(f"Unknown staff code: {parsed['staff_code']}")
+        if parsed.get("location") not in {"Chennai","Bangalore","Hyderabad","Coimbatore","Madurai","Puducherry",""}:
+            issues.append(f"Unknown location: {parsed['location']}")
+        return json.dumps({"is_valid": len(issues)==0, "issues": issues, "parsed": parsed}, indent=2)
 
-@mcp.tool()
-def resume_campaign(campaign_id: str) -> str:
-    """Resume a paused campaign by its ID."""
-    result = api_post(f"/{campaign_id}", {"status": "ACTIVE"})
-    return json.dumps({"campaign_id": campaign_id, "action": "ACTIVE", "result": result})
+    return json.dumps({"error": f"Unknown tool: {name}"})
 
+# ── SSE Transport ─────────────────────────────────────────────────────────────
+sse = SseServerTransport("/messages/")
 
-@mcp.tool()
-def pause_adset(adset_id: str) -> str:
-    """Pause a specific ad set."""
-    result = api_post(f"/{adset_id}", {"status": "PAUSED"})
-    return json.dumps({"adset_id": adset_id, "action": "PAUSED", "result": result})
+async def handle_sse(request: Request):
+    async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
+        await server.run(streams[0], streams[1], server.create_initialization_options())
 
+async def healthcheck(request):
+    return JSONResponse({"status": "ok", "service": "poorvika-meta-ads-mcp", "port": PORT})
 
-@mcp.tool()
-def resume_adset(adset_id: str) -> str:
-    """Resume a paused ad set."""
-    result = api_post(f"/{adset_id}", {"status": "ACTIVE"})
-    return json.dumps({"adset_id": adset_id, "action": "ACTIVE", "result": result})
+app = Starlette(routes=[
+    Route("/",        healthcheck),
+    Route("/health",  healthcheck),
+    Route("/sse",     handle_sse),
+    Mount("/messages/", app=sse.handle_post_message),
+])
 
-
-@mcp.tool()
-def update_campaign_budget(campaign_id: str, new_daily_budget_inr: float) -> str:
-    """Update the daily budget of a campaign. Amount in INR."""
-    budget_paise = int(new_daily_budget_inr * 100)
-    result = api_post(f"/{campaign_id}", {"daily_budget": budget_paise})
-    return json.dumps({"campaign_id": campaign_id, "new_daily_budget_inr": new_daily_budget_inr, "result": result})
-
-
-@mcp.tool()
-def update_adset_budget(adset_id: str, new_daily_budget_inr: float) -> str:
-    """Update the daily budget of a specific ad set. Amount in INR."""
-    budget_paise = int(new_daily_budget_inr * 100)
-    result = api_post(f"/{adset_id}", {"daily_budget": budget_paise})
-    return json.dumps({"adset_id": adset_id, "new_daily_budget_inr": new_daily_budget_inr, "result": result})
-
-
-@mcp.tool()
-def get_ads(adset_id: str) -> str:
-    """List all individual ads within an ad set."""
-    params = {"fields": "id,name,status,creative,effective_status", "limit": 50}
-    data = api_get(f"/{adset_id}/ads", params)
-    return json.dumps(data.get("data", []), indent=2)
-
-
-@mcp.tool()
-def get_ad_insights(ad_id: str, days_back: int = 7) -> str:
-    """Fetch performance insights for a specific ad creative."""
-    params = {
-        "fields": "impressions,reach,clicks,spend,cpm,cpc,ctr,frequency,actions",
-        "time_range": json.dumps(date_range(days_back)),
-    }
-    data = api_get(f"/{ad_id}/insights", params)
-    insights = data.get("data", [{}])
-    return json.dumps(insights[0] if insights else {"message": "No data"}, indent=2)
-
-
-@mcp.tool()
-def get_top_campaigns(days_back: int = 7, metric: str = "ctr", top_n: int = 5) -> str:
-    """Return top N performing campaigns sorted by a given metric.
-    metric: ctr | cpc | cpm | spend | impressions | clicks"""
-    params = {
-        "fields": "campaign_id,campaign_name,impressions,reach,clicks,spend,cpm,cpc,ctr,frequency",
-        "time_range": json.dumps(date_range(days_back)),
-        "level": "campaign",
-        "limit": 100,
-    }
-    data = api_get(f"/{AD_ACCOUNT_ID}/insights", params)
-    rows = data.get("data", [])
-    def safe_float(val):
-        try: return float(val)
-        except: return 0.0
-    ascending   = metric in ["cpc", "cpm"]
-    sorted_rows = sorted(rows, key=lambda x: safe_float(x.get(metric, 0)), reverse=not ascending)
-    return json.dumps({"metric": metric, "days_back": days_back, "top_campaigns": sorted_rows[:top_n]}, indent=2)
-
-
-@mcp.tool()
-def get_daily_report(days_back: int = 7) -> str:
-    """Generate a full daily performance report for Poorvika's Meta Ads account."""
-    acct_params = {
-        "fields": "impressions,reach,clicks,spend,cpm,cpc,ctr,frequency",
-        "time_range": json.dumps(date_range(days_back)),
-    }
-    acct      = api_get(f"/{AD_ACCOUNT_ID}/insights", acct_params).get("data", [{}])[0]
-    camp_params = {
-        "fields": "campaign_id,campaign_name,impressions,clicks,spend,ctr,cpc",
-        "time_range": json.dumps(date_range(days_back)),
-        "level": "campaign",
-        "limit": 100,
-    }
-    campaigns = api_get(f"/{AD_ACCOUNT_ID}/insights", camp_params).get("data", [])
-    def safe_float(val):
-        try: return float(val)
-        except: return 0.0
-    sorted_by_spend = sorted(campaigns, key=lambda x: safe_float(x.get("spend", 0)), reverse=True)
-    report = {
-        "report_date": str(datetime.utcnow().date()),
-        "period_days": days_back,
-        "account_summary": {
-            "total_spend_inr":   f"INR {safe_float(acct.get('spend', 0)):,.2f}",
-            "total_impressions": acct.get("impressions", "0"),
-            "total_reach":       acct.get("reach", "0"),
-            "total_clicks":      acct.get("clicks", "0"),
-            "avg_cpm":           f"INR {safe_float(acct.get('cpm', 0)):,.2f}",
-            "avg_cpc":           f"INR {safe_float(acct.get('cpc', 0)):,.2f}",
-            "avg_ctr":           f"{safe_float(acct.get('ctr', 0)):.2f}%",
-            "avg_frequency":     f"{safe_float(acct.get('frequency', 0)):.2f}",
-        },
-        "top_5_by_spend":         sorted_by_spend[:5],
-        "bottom_5_by_spend":      sorted_by_spend[-5:],
-        "total_active_campaigns": len(campaigns),
-    }
-    return json.dumps(report, indent=2)
-
-
-@mcp.tool()
-def validate_campaign_name(name: str) -> str:
-    """Validate a campaign name against Poorvika's pipe-delimited naming convention."""
-    parts            = [p.strip() for p in name.split("|")]
-    valid_staff      = {"AR", "BS", "SV", "SK", "UP", "KP", "RAJ", "SD", "DEE"}
-    valid_locations  = {"Chennai", "Bangalore", "Hyderabad", "Coimbatore", "Madurai", "Puducherry"}
-    valid_categories = {"Mobile", "Laptop", "Appliance", "Accessory"}
-    issues = []
-    if len(parts) != 10:
-        issues.append(f"Expected 10 segments, found {len(parts)}")
-    parsed = parse_campaign_name(name)
-    if parsed.get("staff_code") and parsed["staff_code"] not in valid_staff:
-        issues.append(f"Unknown staff code: '{parsed['staff_code']}'")
-    if parsed.get("location") and parsed["location"] not in valid_locations:
-        issues.append(f"Unknown location: '{parsed['location']}'")
-    if parsed.get("main_category") and parsed["main_category"] not in valid_categories:
-        issues.append(f"Unknown main category: '{parsed['main_category']}'")
-    return json.dumps({"name": name, "is_valid": len(issues) == 0, "issues": issues, "parsed": parsed}, indent=2)
-
-
-@mcp.tool()
-def get_spend_by_objective(days_back: int = 30) -> str:
-    """Break down total Meta Ads spend by campaign objective (REACH, TRAFFIC, etc.)"""
-    params = {
-        "fields": "campaign_name,objective,spend,impressions,clicks",
-        "time_range": json.dumps(date_range(days_back)),
-        "level": "campaign",
-        "limit": 100,
-    }
-    rows = api_get(f"/{AD_ACCOUNT_ID}/insights", params).get("data", [])
-    breakdown: dict = {}
-    for row in rows:
-        obj   = row.get("objective", "UNKNOWN")
-        spend = float(row.get("spend", 0))
-        if obj not in breakdown:
-            breakdown[obj] = {"spend": 0, "impressions": 0, "clicks": 0, "campaign_count": 0}
-        breakdown[obj]["spend"]          += spend
-        breakdown[obj]["impressions"]    += int(row.get("impressions", 0))
-        breakdown[obj]["clicks"]         += int(row.get("clicks", 0))
-        breakdown[obj]["campaign_count"] += 1
-    for obj in breakdown:
-        breakdown[obj]["spend"] = f"INR {breakdown[obj]['spend']:,.2f}"
-    return json.dumps({"period_days": days_back, "spend_by_objective": breakdown}, indent=2)
-
-
-# ── Entry Point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print(f"✅ Poorvika Meta Ads MCP Server starting on port {PORT}")
     uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
