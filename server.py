@@ -74,6 +74,7 @@ async def list_tools():
         types.Tool(name="update_adset_budget",   description="Update ad set daily budget in INR",                inputSchema={"type":"object","properties":{"adset_id":{"type":"string"},"new_daily_budget_inr":{"type":"number"}},"required":["adset_id","new_daily_budget_inr"]}),
         types.Tool(name="get_spend_by_objective",description="Spend breakdown by objective (REACH/TRAFFIC etc)", inputSchema={"type":"object","properties":{"days_back":{"type":"integer","default":30}}}),
         types.Tool(name="validate_campaign_name",description="Validate Poorvika pipe-delimited campaign name",   inputSchema={"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}),
+        types.Tool(name="search_campaign_by_name", description="Search campaigns by name keyword, returns ID, name, status. Use this before pause/resume by name.", inputSchema={"type":"object","properties":{"name_query":{"type":"string"},"status_filter":{"type":"string","default":"ALL"}},"required":["name_query"]}),
     ]
 
 # ── Tool Execution ─────────────────────────────────────────────────────────────
@@ -201,6 +202,31 @@ def _execute(name, args):
         if parsed.get("location") not in {"Chennai","Bangalore","Hyderabad","Coimbatore","Madurai","Puducherry",""}:
             issues.append(f"Unknown location: {parsed['location']}")
         return json.dumps({"is_valid": len(issues)==0, "issues": issues, "parsed": parsed}, indent=2)
+
+    elif name == "search_campaign_by_name":
+        query   = args["name_query"].lower()
+        sf      = args.get("status_filter", "ALL")
+        results = []
+        params  = {"fields": "id,name,status,objective,daily_budget", "limit": 100}
+        if sf != "ALL":
+            params["effective_status"] = json.dumps([sf])
+        data    = api_get(f"/{AD_ACCOUNT_ID}/campaigns", params)
+        for c in data.get("data", []):
+            if query in c.get("name", "").lower():
+                results.append({
+                    "id": c["id"], "name": c.get("name"),
+                    "status": c.get("status"), "objective": c.get("objective"),
+                    "daily_budget_inr": int(c["daily_budget"])/100 if c.get("daily_budget") else None
+                })
+        # paginate if more results
+        while data.get("paging", {}).get("next"):
+            data = api_get("", {"after": data["paging"]["cursors"]["after"],
+                                "fields": "id,name,status,objective,daily_budget",
+                                "limit": 100, "access_token": ACCESS_TOKEN})
+            for c in data.get("data", []):
+                if query in c.get("name", "").lower():
+                    results.append({"id": c["id"], "name": c.get("name"), "status": c.get("status")})
+        return json.dumps({"query": args["name_query"], "matches": len(results), "campaigns": results}, indent=2)
 
     return json.dumps({"error": f"Unknown tool: {name}"})
 
