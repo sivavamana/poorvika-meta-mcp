@@ -60,7 +60,7 @@ def parse_name(name):
 @server.list_tools()
 async def list_tools():
     return [
-        types.Tool(name="get_campaigns",         description="Get all campaigns from Poorvika Meta Ads account", inputSchema={"type":"object","properties":{"status_filter":{"type":"string","default":"ACTIVE"}}}),
+        types.Tool(name="get_campaigns",         description="Get campaigns from Poorvika Meta Ads account. Use limit to control how many (default 25, max 50).", inputSchema={"type":"object","properties":{"status_filter":{"type":"string","default":"ACTIVE"},"limit":{"type":"integer","default":25}}}),
         types.Tool(name="get_account_insights",  description="Get account-level performance summary",            inputSchema={"type":"object","properties":{"days_back":{"type":"integer","default":7}}}),
         types.Tool(name="get_campaign_insights", description="Get insights for a specific campaign",             inputSchema={"type":"object","properties":{"campaign_id":{"type":"string"},"days_back":{"type":"integer","default":7}},"required":["campaign_id"]}),
         types.Tool(name="get_adsets",            description="List all ad sets under a campaign",                inputSchema={"type":"object","properties":{"campaign_id":{"type":"string"}},"required":["campaign_id"]}),
@@ -122,14 +122,15 @@ def _execute(name, args):
     elif name == "get_daily_report":
         days  = args.get("days_back", 7)
         tr    = json.dumps(dr(days))
+        def sf(v):
+            try: return float(v)
+            except: return 0
+        # Fetch account summary and top 20 campaigns in parallel-ish (sequential but lightweight)
         acct  = api_get(f"/{AD_ACCOUNT_ID}/insights",
                         {"fields":"impressions,reach,clicks,spend,cpm,cpc,ctr","time_range":tr}).get("data",[{}])[0]
         camps = api_get(f"/{AD_ACCOUNT_ID}/insights",
                         {"fields":"campaign_name,spend,clicks,ctr,cpc","time_range":tr,
-                         "level":"campaign","limit":100}).get("data",[])
-        def sf(v):
-            try: return float(v)
-            except: return 0
+                         "level":"campaign","limit":20}).get("data",[])
         by_spend = sorted(camps, key=lambda x: sf(x.get("spend",0)), reverse=True)
         return json.dumps({
             "date": str(datetime.utcnow().date()), "days": days,
@@ -147,7 +148,7 @@ def _execute(name, args):
         top_n  = args.get("top_n", 5)
         rows   = api_get(f"/{AD_ACCOUNT_ID}/insights",
                          {"fields":"campaign_name,spend,clicks,ctr,cpc,impressions",
-                          "time_range":json.dumps(dr(days)),"level":"campaign","limit":100}).get("data",[])
+                          "time_range":json.dumps(dr(days)),"level":"campaign","limit":30}).get("data",[])
         def sf(v):
             try: return float(v)
             except: return 0
