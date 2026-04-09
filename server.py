@@ -318,28 +318,5 @@ def get_spend_by_objective(days_back: int = 30) -> str:
 
 # ── Entry Point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    from mcp.server.sse import SseServerTransport
-    from starlette.applications import Starlette
-    from starlette.routing import Route, Mount
-    import uvicorn
-
-    sse = SseServerTransport("/messages/")
-
-    async def handle_sse(request):
-        async with sse.connect_sse(
-            request.scope, request.receive, request._send
-        ) as streams:
-            await mcp._mcp_server.run(
-                streams[0], streams[1],
-                mcp._mcp_server.create_initialization_options()
-            )
-
-    async def handle_messages(request):
-        await sse.handle_post_message(request.scope, request.receive, request._send)
-
-    app = Starlette(routes=[
-        Route("/sse", endpoint=handle_sse),
-        Mount("/messages/", app=sse.handle_post_message),
-    ])
-
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    print(f"✅ Poorvika Meta Ads MCP Server starting on port {PORT}")
+    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
